@@ -3,7 +3,8 @@ use self::clock::{Clock, SystemClock};
 use self::defined_activity::DefinedPaymentActivity;
 use self::random_activity::{NetworkGraphView, RandomPaymentActivity};
 use self::sim_node::{
-    ln_node_from_graph, populate_network_graph, ChannelPolicy, SimGraph, SimulatedChannel,
+    ln_node_from_graph, populate_network_graph, ChannelPolicy, Interceptor, SimGraph,
+    SimulatedChannel,
 };
 use async_trait::async_trait;
 use bitcoin::secp256k1::PublicKey;
@@ -591,6 +592,7 @@ impl Simulation {
         channels: Vec<SimulatedChannel>,
         activity: Vec<ActivityDefinition>,
         clock: Arc<dyn Clock>,
+        interceptors: Vec<Arc<dyn Interceptor>>,
     ) -> Result<(Self, Arc<Mutex<SimGraph>>), SimulationError> {
         let (shutdown_trigger, shutdown_listener) = triggered::trigger();
 
@@ -600,7 +602,7 @@ impl Simulation {
                 channels.clone(),
                 clock.clone(),
                 cfg.write_results.clone(),
-                vec![],
+                interceptors,
                 shutdown_listener.clone(),
                 shutdown_trigger.clone(),
             )

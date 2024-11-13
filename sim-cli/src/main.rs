@@ -10,7 +10,8 @@ use anyhow::anyhow;
 use clap::builder::TypedValueParser;
 use clap::Parser;
 use log::LevelFilter;
-use simln_lib::sim_node::{node_info, SimGraph, SimulatedChannel};
+use simln_lib::interceptors::LatencyIntercepor;
+use simln_lib::sim_node::{node_info, Interceptor, SimGraph, SimulatedChannel};
 use simln_lib::{
     cln::ClnNode, lnd::LndNode, ActivityDefinition, ActivityParser, LightningError, LightningNode,
     NodeConnection, NodeId, NodeInfo, SimParams, Simulation, SimulationCfg, WriteResults,
@@ -86,6 +87,9 @@ struct Cli {
     /// Speedup multiplier for wall clock when running in simulated network mode.
     #[clap(long, short)]
     clock_speedup: Option<u32>,
+    /// Latency to optionally introduce for simulated nodes.
+    #[clap(long)]
+    latency_ms: Option<f32>,
 }
 
 #[tokio::main]
@@ -218,6 +222,11 @@ async fn create_simulation(
         };
 
         let validated_activities = validate_activities(activity, &nodes_info, get_node).await?;
+        let interceptors = if let Some(l) = cli.latency_ms {
+            vec![Arc::new(LatencyIntercepor::new_poisson(l)?) as Arc<dyn Interceptor>]
+        } else {
+            vec![]
+        };
 
         let (simulation, graph) = Simulation::new_with_sim_network(
             cfg,
@@ -226,6 +235,7 @@ async fn create_simulation(
             Arc::new(SimulationClock::new(
                 cli.clock_speedup.unwrap_or(DEFAULT_CLOCK_SPEEDUP),
             )?),
+            interceptors,
         )
         .await?;
         Ok((simulation, Some(graph)))
