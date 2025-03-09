@@ -22,7 +22,7 @@ async fn main() -> anyhow::Result<()> {
         .init()
         .unwrap();
 
-    let (sim, sim_network) = create_simulation(&cli).await?;
+    let (sim, _sim_network) = create_simulation(&cli).await?;
     let sim2 = sim.clone();
     ctrlc::set_handler(move || {
         log::info!("Shutting down simulation.");
@@ -30,10 +30,6 @@ async fn main() -> anyhow::Result<()> {
     })?;
 
     sim.run().await?;
-
-    if let Some(network) = sim_network {
-        network.lock().await.wait_for_shutdown().await;
-    }
 
     Ok(())
 }

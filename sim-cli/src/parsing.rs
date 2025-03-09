@@ -11,6 +11,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio_util::task::TaskTracker;
 
 use anyhow::anyhow;
 use clap::builder::TypedValueParser;
@@ -86,7 +87,7 @@ pub struct Cli {
     #[clap(long, short)]
     pub fix_seed: Option<u64>,
     /// Speedup multiplier for wall clock when running in simulated network mode.
-    #[clap(long, short)]
+    #[clap(long)]
     pub clock_speedup: Option<u32>,
     /// Latency to optionally introduce for simulated nodes.
     #[clap(long)]
@@ -164,7 +165,10 @@ pub async fn create_simulation(
         };
 
         let validated_activities = validate_activities(activity, &clients_info, get_node).await?;
-        Ok((Simulation::new(cfg, clients, validated_activities), None))
+        Ok((
+            Simulation::new(cfg, clients, validated_activities, TaskTracker::new()),
+            None,
+        ))
     } else {
         // Convert nodes representation for parsing to SimulatedChannel.
         let channels = sim_network
@@ -212,6 +216,7 @@ pub async fn create_simulation(
                 cli.clock_speedup.unwrap_or(DEFAULT_CLOCK_SPEEDUP),
             )?),
             interceptors,
+            TaskTracker::new(),
             shutdown_listener,
             shutdown_trigger,
         )

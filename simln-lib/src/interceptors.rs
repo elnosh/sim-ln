@@ -61,6 +61,7 @@ mod tests {
     use crate::sim_node::{CustomRecords, ForwardingError, HtlcRef, InterceptRequest};
     use crate::test_utils::get_random_keypair;
     use crate::ShortChannelID;
+    use lightning::ln::PaymentHash;
     use ntest::assert_true;
     use rand::distributions::Distribution;
     use rand::Rng;
@@ -89,6 +90,7 @@ mod tests {
         let request = InterceptRequest {
             response: sender,
             forwarding_node: pk,
+            payment_hash: PaymentHash([0; 32]),
             incoming_htlc: HtlcRef {
                 channel_id: ShortChannelID::from(123),
                 index: 1,

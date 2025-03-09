@@ -2099,6 +2099,7 @@ dependencies = [
  "simln-lib",
  "simple_logger",
  "tokio",
+ "tokio-util",
  "triggered",
 ]
 
@@ -2127,6 +2128,7 @@ dependencies = [
  "serde_millis",
  "thiserror",
  "tokio",
+ "tokio-util",
  "tonic 0.8.3",
  "triggered",
 ]
@@ -2395,16 +2397,17 @@ dependencies = [
 
 [[package]]
 name = "tokio-util"
-version = "0.7.9"
+version = "0.7.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d68074620f57a0b21594d9735eb2e98ab38b17f80d3fcb189fca266771ca60d"
+checksum = "6b9590b93e6fcc1739458317cccd391ad3955e2bde8913edf6f95f9e65a8f034"
 dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
+ "hashbrown 0.14.2",
  "pin-project-lite",
  "tokio",
- "tracing",
 ]
 
 [[package]]

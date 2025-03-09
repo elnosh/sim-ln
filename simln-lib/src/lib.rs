@@ -25,8 +25,8 @@ use std::{collections::HashMap, sync::Arc};
 use thiserror::Error;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::Mutex;
-use tokio::task::JoinSet;
 use tokio::{select, time, time::Duration};
+use tokio_util::task::TaskTracker;
 use triggered::{Listener, Trigger};
 
 mod batched_writer;
@@ -543,6 +543,11 @@ pub struct Simulation {
     nodes: HashMap<PublicKey, Arc<Mutex<dyn LightningNode>>>,
     /// The activity that are to be executed on the node.
     activity: Vec<ActivityDefinition>,
+    /// Results logger that holds the simulation statistics.
+    results: Arc<Mutex<PaymentResultLogger>>,
+    /// Track all tasks spawned for use in the simulation. When used in the `run` method, it will wait for
+    /// these tasks to complete before returning.
+    tasks: TaskTracker,
     /// High level triggers used to manage simulation tasks and shutdown.
     shutdown_trigger: Trigger,
     shutdown_listener: Listener,
@@ -573,12 +578,15 @@ impl Simulation {
         cfg: SimulationCfg,
         nodes: HashMap<PublicKey, Arc<Mutex<dyn LightningNode>>>,
         activity: Vec<ActivityDefinition>,
+        tasks: TaskTracker,
     ) -> Self {
         let (shutdown_trigger, shutdown_listener) = triggered::trigger();
         Self {
             cfg,
             nodes,
             activity,
+            results: Arc::new(Mutex::new(PaymentResultLogger::new())),
+            tasks,
             shutdown_trigger,
             shutdown_listener,
             clock: Arc::new(SystemClock {}),
@@ -593,10 +601,10 @@ impl Simulation {
         activity: Vec<ActivityDefinition>,
         clock: Arc<dyn Clock>,
         interceptors: Vec<Arc<dyn Interceptor>>,
+        tasks: TaskTracker,
         shutdown_listener: Listener,
         shutdown_trigger: Trigger,
     ) -> Result<(Self, Arc<Mutex<SimGraph>>), SimulationError> {
-
         // Setup a simulation graph that will handle propagation of payments through the network.
         let simulation_graph = Arc::new(Mutex::new(
             SimGraph::new(
@@ -605,6 +613,7 @@ impl Simulation {
                 cfg.write_results.clone(),
                 interceptors,
                 shutdown_listener.clone(),
+                tasks.clone(),
                 shutdown_trigger.clone(),
             )
             .map_err(|e| SimulationError::SimulatedNetworkError(format!("{:?}", e)))?,
@@ -624,10 +633,12 @@ impl Simulation {
             Self {
                 nodes, // Here we should filter nodes out!
                 activity,
+                tasks,
                 shutdown_trigger,
                 shutdown_listener,
                 cfg,
                 clock,
+                results: Arc::new(Mutex::new(PaymentResultLogger::new())),
             },
             simulation_graph,
         ))
@@ -714,7 +725,19 @@ impl Simulation {
         Ok(())
     }
 
+    /// run until the simulation completes or we hit an error.
+    /// Note that it will wait for the tasks in self.tasks to complete
+    /// before returning.
     pub async fn run(&self) -> Result<(), SimulationError> {
+        self.internal_run().await?;
+        // Close our TaskTracker and wait for any background tasks
+        // spawned during internal_run to complete.
+        self.tasks.close();
+        self.tasks.wait().await;
+        Ok(())
+    }
+
+    async fn internal_run(&self) -> Result<(), SimulationError> {
         if let Some(total_time) = self.cfg.total_time {
             log::info!("Running the simulation for {}s.", total_time.as_secs());
         } else {
@@ -729,7 +752,6 @@ impl Simulation {
             self.activity.len(),
             self.nodes.len()
         );
-        let mut tasks = JoinSet::new();
 
         // Before we start the simulation up, start tasks that will be responsible for gathering simulation data.
         // The event channels are shared across our functionality:
@@ -738,21 +760,15 @@ impl Simulation {
         // - Event Receiver: used by data reporting to receive events that have been simulated that need to be
         //   tracked and recorded.
         let (event_sender, event_receiver) = channel(1);
-        self.run_data_collection(event_receiver, &mut tasks);
+        self.run_data_collection(event_receiver, &self.tasks);
 
         // Get an execution kit per activity that we need to generate and spin up consumers for each source node.
         let activities = match self.activity_executors().await {
             Ok(a) => a,
             Err(e) => {
                 // If we encounter an error while setting up the activity_executors,
-                // we need to shutdown and wait for tasks to finish. We have started background tasks in the
-                // run_data_collection function, so we should shut those down before returning.
+                // we need to shutdown and return.
                 self.shutdown();
-                while let Some(res) = tasks.join_next().await {
-                    if let Err(e) = res {
-                        log::error!("Task exited with error: {e}.");
-                    }
-                }
                 return Err(e);
             },
         };
@@ -762,27 +778,20 @@ impl Simulation {
                 .map(|generator| generator.source_info.pubkey)
                 .collect(),
             event_sender.clone(),
-            &mut tasks,
+            &self.tasks,
         );
 
         // Next, we'll spin up our actual producers that will be responsible for triggering the configured activity.
-        // The producers will use their own JoinSet so that the simulation can be shutdown if they all finish.
-        let mut producer_tasks = JoinSet::new();
+        // The producers will use their own TaskTracker so that the simulation can be shutdown if they all finish.
+        let producer_tasks = TaskTracker::new();
         match self
-            .dispatch_producers(activities, consumer_channels, &mut producer_tasks)
+            .dispatch_producers(activities, consumer_channels, &producer_tasks)
             .await
         {
             Ok(_) => {},
             Err(e) => {
-                // If we encounter an error in dispatch_producers, we need to shutdown and wait for tasks to finish.
-                // We have started background tasks in the run_data_collection function,
-                // so we should shut those down before returning.
+                // If we encounter an error in dispatch_producers, we need to shutdown and return.
                 self.shutdown();
-                while let Some(res) = tasks.join_next().await {
-                    if let Err(e) = res {
-                        log::error!("Task exited with error: {e}.");
-                    }
-                }
                 return Err(e);
             },
         }
@@ -790,12 +799,9 @@ impl Simulation {
         // Start a task that waits for the producers to finish.
         // If all producers finish, then there is nothing left to do and the simulation can be shutdown.
         let producer_trigger = self.shutdown_trigger.clone();
-        tasks.spawn(async move {
-            while let Some(res) = producer_tasks.join_next().await {
-                if let Err(e) = res {
-                    log::error!("Producer exited with error: {e}.");
-                }
-            }
+        self.tasks.spawn(async move {
+            producer_tasks.close();
+            producer_tasks.wait().await;
             log::info!("All producers finished. Shutting down.");
             producer_trigger.trigger()
         });
@@ -806,7 +812,7 @@ impl Simulation {
             let listener = self.shutdown_listener.clone();
             let clock = self.clock.clone();
 
-            tasks.spawn(async move {
+            self.tasks.spawn(async move {
                 select! {
                     biased;
                     _ = listener.clone() => {
@@ -824,18 +830,7 @@ impl Simulation {
             });
         }
 
-        // We always want to wait for all threads to exit, so we wait for all of them to exit and track any errors
-        // that surface. It's okay if there are multiple and one is overwritten, we just want to know whether we
-        // exited with an error or not.
-        let mut success = true;
-        while let Some(res) = tasks.join_next().await {
-            if let Err(e) = res {
-                log::error!("Task exited with error: {e}.");
-                success = false;
-            }
-        }
-
-        success.then_some(()).ok_or(SimulationError::TaskError)
+        Ok(())
     }
 
     pub fn shutdown(&self) {
@@ -855,7 +850,7 @@ impl Simulation {
     fn run_data_collection(
         &self,
         output_receiver: Receiver<SimulationOutput>,
-        tasks: &mut JoinSet<()>,
+        tasks: &TaskTracker,
     ) {
         let listener = self.shutdown_listener.clone();
         let shutdown = self.shutdown_trigger.clone();
@@ -868,11 +863,17 @@ impl Simulation {
         // psr: produce simulation results
         let psr_listener = listener.clone();
         let psr_shutdown = shutdown.clone();
+        let psr_tasks = tasks.clone();
         tasks.spawn(async move {
             log::debug!("Starting simulation results producer.");
-            if let Err(e) =
-                produce_simulation_results(nodes, output_receiver, results_sender, psr_listener)
-                    .await
+            if let Err(e) = produce_simulation_results(
+                nodes,
+                output_receiver,
+                results_sender,
+                psr_listener,
+                &psr_tasks,
+            )
+            .await
             {
                 psr_shutdown.trigger();
                 log::error!("Produce simulation results exited with error: {e:?}.");
@@ -1017,7 +1018,7 @@ impl Simulation {
         &self,
         consuming_nodes: HashSet<PublicKey>,
         output_sender: Sender<SimulationOutput>,
-        tasks: &mut JoinSet<()>,
+        tasks: &TaskTracker,
     ) -> HashMap<PublicKey, Sender<SimulationEvent>> {
         let mut channels = HashMap::new();
 
@@ -1063,7 +1064,7 @@ impl Simulation {
         &self,
         executors: Vec<ExecutorKit>,
         producer_channels: HashMap<PublicKey, Sender<SimulationEvent>>,
-        tasks: &mut JoinSet<()>,
+        tasks: &TaskTracker,
     ) -> Result<(), SimulationError> {
         for executor in executors {
             let sender = producer_channels.get(&executor.source_info.pubkey).ok_or(
@@ -1442,9 +1443,8 @@ async fn produce_simulation_results(
     mut output_receiver: Receiver<SimulationOutput>,
     results: Sender<(Payment, PaymentResult)>,
     listener: Listener,
+    tasks: &TaskTracker,
 ) -> Result<(), SimulationError> {
-    let mut set = tokio::task::JoinSet::new();
-
     let result = loop {
         tokio::select! {
             biased;
@@ -1457,7 +1457,7 @@ async fn produce_simulation_results(
                         match simulation_output{
                             SimulationOutput::SendPaymentSuccess(payment) => {
                                 if let Some(source_node) = nodes.get(&payment.source) {
-                                    set.spawn(track_payment_result(
+                                    tasks.spawn(track_payment_result(
                                         source_node.clone(), results.clone(), payment, listener.clone()
                                     ));
                                 } else {
@@ -1488,11 +1488,6 @@ async fn produce_simulation_results(
     };
 
     log::debug!("Simulation results producer exiting.");
-    while let Some(res) = set.join_next().await {
-        if let Err(e) = res {
-            log::error!("Simulation results producer task exited with error: {e}.");
-        }
-    }
 
     result
 }

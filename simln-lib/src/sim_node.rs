@@ -9,6 +9,11 @@ use bitcoin::hashes::{sha256::Hash as Sha256, Hash};
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Network, ScriptBuf, TxOut};
 use lightning::ln::chan_utils::make_funding_redeemscript;
+use std::collections::{hash_map::Entry, HashMap};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio_util::task::TaskTracker;
+
 use lightning::ln::features::{ChannelFeatures, NodeFeatures};
 use lightning::ln::msgs::{
     LightningError as LdkError, UnsignedChannelAnnouncement, UnsignedChannelUpdate,
@@ -22,16 +27,12 @@ use lightning::routing::scoring::ProbabilisticScorer;
 use lightning::routing::utxo::{UtxoLookup, UtxoResult};
 use lightning::util::logger::{Level, Logger, Record};
 use serde::{Deserialize, Serialize};
-use std::collections::{hash_map::Entry, HashMap};
 use std::error::Error;
 use std::fmt::Display;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::select;
 use tokio::sync::oneshot::{channel, Receiver, Sender};
 use tokio::sync::Mutex;
-use tokio::task::JoinSet;
 use triggered::{Listener, Trigger};
 
 /// ForwardingError represents the various errors that we can run into when forwarding payments in a simulated network.
@@ -840,8 +841,9 @@ pub struct SimGraph {
     /// channels maps the scid of a channel to its current simulation state.
     channels: Arc<Mutex<HashMap<ShortChannelID, SimulatedChannel>>>,
 
-    /// track all tasks spawned to process payments in the graph.
-    tasks: JoinSet<()>,
+    /// track all tasks spawned to process payments in the graph. Note that handling the shutdown of tasks
+    /// in this tracker must be done externally.
+    tasks: TaskTracker,
 
     clock: Arc<dyn Clock>,
 
@@ -868,6 +870,7 @@ impl SimGraph {
         write_results: Option<WriteResults>,
         interceptors: Vec<Arc<dyn Interceptor>>,
         shutdown_listener: Listener,
+        tasks: TaskTracker,
         shutdown_trigger: Trigger,
     ) -> Result<Self, SimulationError> {
         let mut nodes: HashMap<PublicKey, GraphNodeInfo> = HashMap::new();
@@ -919,32 +922,11 @@ impl SimGraph {
             channels: Arc::new(Mutex::new(channels)),
             clock,
             writer,
-            tasks: JoinSet::new(),
+            tasks,
             interceptors,
             shutdown_listener,
             shutdown_trigger,
         })
-    }
-
-    /// Blocks until all tasks created by the simulator have shut down. This function does not trigger shutdown,
-    /// because it expects erroring-out tasks to handle their own shutdown triggering.
-    pub async fn wait_for_shutdown(&mut self) {
-        log::debug!("Waiting for simulated graph to shutdown.");
-
-        while let Some(res) = self.tasks.join_next().await {
-            if let Err(e) = res {
-                log::error!("Graph task exited with error: {e}");
-            }
-        }
-
-        // If we're shutting down, force-flush any pending writes to disk.
-        if let Some(w) = self.writer.clone() {
-            if let Err(e) = w.lock().await.write(true) {
-                log::error!("Failed to flush forwards to disk: {e}");
-            }
-        }
-
-        log::debug!("Simulated graph shutdown.");
     }
 }
 
@@ -2158,6 +2140,7 @@ mod tests {
                     None,
                     vec![],
                     listener.clone(),
+                    TaskTracker::new(),
                     shutdown.clone(),
                 )
                 .expect("could not create test graph"),
@@ -2292,7 +2275,8 @@ mod tests {
         assert_eq!(test_kit.channel_balances().await, expected_balances);
 
         test_kit.shutdown.trigger();
-        test_kit.graph.wait_for_shutdown().await;
+        test_kit.graph.tasks.close();
+        test_kit.graph.tasks.wait().await;
     }
 
     /// Tests successful dispatch of a multi-hop payment.
@@ -2321,7 +2305,8 @@ mod tests {
         assert_eq!(test_kit.channel_balances().await, expected_balances);
 
         test_kit.shutdown.trigger();
-        test_kit.graph.wait_for_shutdown().await;
+        test_kit.graph.tasks.close();
+        test_kit.graph.tasks.wait().await;
     }
 
     /// Tests success and failure for single hop payments, which are an edge case in our state machine.
@@ -2352,7 +2337,8 @@ mod tests {
         assert_eq!(test_kit.channel_balances().await, expected_balances);
 
         test_kit.shutdown.trigger();
-        test_kit.graph.wait_for_shutdown().await;
+        test_kit.graph.tasks.close();
+        test_kit.graph.tasks.wait().await;
     }
 
     /// Tests failing back of multi-hop payments at various failure indexes.
@@ -2392,6 +2378,7 @@ mod tests {
         assert_eq!(test_kit.channel_balances().await, expected_balances);
 
         test_kit.shutdown.trigger();
-        test_kit.graph.wait_for_shutdown().await;
+        test_kit.graph.tasks.close();
+        test_kit.graph.tasks.wait().await;
     }
 }
