@@ -9,8 +9,10 @@ use bitcoin::{Network, ScriptBuf, TxOut};
 use lightning::ln::chan_utils::make_funding_redeemscript;
 use serde::{Deserialize, Serialize};
 use std::collections::{hash_map::Entry, HashMap};
+use std::fmt::Display;
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
+use tokio::task::JoinSet;
 use tokio_util::task::TaskTracker;
 
 use lightning::ln::features::{ChannelFeatures, NodeFeatures};
@@ -61,6 +63,8 @@ pub enum ForwardingError {
     /// The forwarded htlc has insufficient fee for the channel's policy (fee / expected fee / base fee / prop fee).
     #[error("InsufficientFee: offered fee: {0} (base: {1}, prop: {2}) < expected: {3}")]
     InsufficientFee(u64, u64, u64, u64),
+    #[error("InterceptorError: {0}")]
+    InterceptorError(String),
 }
 
 /// CriticalError represents an error while propagating a payment in a simulated network that
@@ -89,6 +93,10 @@ pub enum CriticalError {
     /// Sanity check on channel balances failed (node balances / channel capacity).
     #[error("SanityCheckFailed: node balance: {0} != capacity: {1}")]
     SanityCheckFailed(u64, u64),
+    #[error("DuplicateCustomRecord: key {0}")]
+    DuplicateCustomRecord(u64),
+    #[error("InterceptorError: {0}")]
+    InterceptorError(String),
 }
 
 type ForwardResult = Result<Result<(), ForwardingError>, CriticalError>;
@@ -692,6 +700,105 @@ impl<T: SimNetwork> LightningNode for SimNode<'_, T> {
     }
 }
 
+#[async_trait]
+pub trait Interceptor: Send + Sync {
+    /// Implemented by HTLC interceptors that provide input on the resolution of HTLCs forwarded in the simulation.
+    async fn intercept_htlc(
+        &self,
+        req: InterceptRequest,
+    ) -> Result<Result<CustomRecords, ForwardingError>, CriticalError>;
+
+    /// Notifies the interceptor that a previously intercepted htlc has been resolved. Default implementation is a no-op
+    /// for cases where the interceptor only cares about interception, not resolution of htlcs.
+    async fn notify_resolution(&self, _res: InterceptResolution) -> Result<(), CriticalError> {
+        Ok(())
+    }
+
+    /// Returns an identifying name for the interceptor for logging, does not need to be unique.
+    fn name(&self) -> String;
+}
+
+/// Request sent to an external interceptor to provide feedback on the resolution of the HTLC.
+#[derive(Debug, Clone)]
+pub struct InterceptRequest {
+    /// The node that is forwarding this htlc.
+    pub forwarding_node: PublicKey,
+
+    /// The payment hash for the htlc (note that this is not unique).
+    pub payment_hash: PaymentHash,
+
+    /// Unique identifier for the htlc that references the channel this htlc was delivered on.
+    pub incoming_htlc: HtlcRef,
+
+    /// Custom records provided by the incoming htlc.
+    pub incoming_custom_records: CustomRecords,
+
+    /// The short channel id for the outgoing channel that this htlc should be forwarded over. It
+    /// will be None if intercepting node is the receiver of the payment.
+    pub outgoing_channel_id: Option<ShortChannelID>,
+
+    /// The amount that was forwarded over the incoming_channel_id.
+    pub incoming_amount_msat: u64,
+
+    /// The amount that will be forwarded over to outgoing_channel_id.
+    pub outgoing_amount_msat: u64,
+
+    /// The expiry height on the incoming htlc.
+    pub incoming_expiry_height: u32,
+
+    /// The expiry height on the outgoing htlc.
+    pub outgoing_expiry_height: u32,
+
+    // The listener on which the interceptor will receive shutdown signals.
+    pub shutdown_listener: Listener,
+}
+
+impl Display for InterceptRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "htlc forwarded by {} over {}:{} -> {} forward amounts {} {}",
+            self.forwarding_node,
+            self.incoming_htlc.channel_id,
+            self.incoming_htlc.index,
+            {
+                if let Some(c) = self.outgoing_channel_id {
+                    format!("-> {c}")
+                } else {
+                    "receive".to_string()
+                }
+            },
+            self.incoming_amount_msat,
+            self.outgoing_amount_msat
+        )
+    }
+}
+
+/// Notification sent to an external interceptor notifying that a htlc that was previously intercepted has been
+/// resolved.
+pub struct InterceptResolution {
+    /// The node that is forwarding this HTLC.
+    pub forwarding_node: PublicKey,
+
+    /// Unique identifier for the incoming htlc.
+    pub incoming_htlc: HtlcRef,
+
+    /// The short channel id for the outgoing channel that this htlc should be forwarded over, None if notifying the
+    /// receiving node.
+    pub outgoing_channel_id: Option<ShortChannelID>,
+
+    /// True if the htlc was settled successfully.
+    pub success: bool,
+}
+
+pub type CustomRecords = HashMap<u64, Vec<u8>>;
+
+#[derive(Debug, Clone)]
+pub struct HtlcRef {
+    pub channel_id: ShortChannelID,
+    pub index: u64,
+}
+
 /// Graph is the top level struct that is used to coordinate simulation of lightning nodes.
 pub struct SimGraph {
     /// nodes caches the list of nodes in the network with a vector of their channel capacities, only used for quick
@@ -705,6 +812,9 @@ pub struct SimGraph {
     /// in this tracker must be done externally.
     tasks: TaskTracker,
 
+    /// Optional set of interceptors that will be called every time a HTLC is added to a simulated channel.
+    interceptors: Vec<Arc<dyn Interceptor>>,
+
     /// trigger shutdown if a critical error occurs.
     shutdown_trigger: Trigger,
 }
@@ -714,6 +824,7 @@ impl SimGraph {
     pub fn new(
         graph_channels: Vec<SimulatedChannel>,
         tasks: TaskTracker,
+        interceptors: Vec<Arc<dyn Interceptor>>,
         shutdown_trigger: Trigger,
     ) -> Result<Self, SimulationError> {
         let mut nodes: HashMap<PublicKey, Vec<u64>> = HashMap::new();
@@ -748,6 +859,7 @@ impl SimGraph {
             nodes,
             channels: Arc::new(Mutex::new(channels)),
             tasks,
+            interceptors,
             shutdown_trigger,
         })
     }
@@ -874,6 +986,7 @@ impl SimNetwork for SimGraph {
             path.clone(),
             payment_hash,
             sender,
+            self.interceptors.clone(),
             self.shutdown_trigger.clone(),
         ));
     }
@@ -921,10 +1034,13 @@ async fn add_htlcs(
     source: PublicKey,
     route: Path,
     payment_hash: PaymentHash,
+    interceptors: Vec<Arc<dyn Interceptor>>,
 ) -> Result<Result<(), (Option<usize>, ForwardingError)>, CriticalError> {
     let mut outgoing_node = source;
     let mut outgoing_amount = route.fee_msat() + route.final_value_msat();
     let mut outgoing_cltv = route.hops.iter().map(|hop| hop.cltv_expiry_delta).sum();
+
+    let mut incoming_custom_records = HashMap::new();
 
     // Tracks the hop index that we need to remove htlcs from on payment completion (both success and failure).
     // Given a payment from A to C, over the route A -- B -- C, this index has the following meanings:
@@ -932,7 +1048,7 @@ async fn add_htlcs(
     // - Some(0): A -- B added the HTLC but B could not forward the HTLC to C, so it only needs removing on A -- B.
     // - Some(1): A -- B and B -- C added the HTLC, so it should be removed from the full route.
     let mut fail_idx = None;
-
+    let last_hop = route.hops.len() - 1;
     for (i, hop) in route.hops.iter().enumerate() {
         // Lock the node that we want to add the HTLC to next. We choose to lock one hop at a time (rather than for
         // the whole route) so that we can mimic the behavior of payments in the real network where the HTLCs in a
@@ -940,8 +1056,12 @@ async fn add_htlcs(
         let mut node_lock = nodes.lock().await;
         let scid = ShortChannelID::from(hop.short_channel_id);
 
-        if let Some(channel) = node_lock.get_mut(&scid) {
-            if let Err(e) = channel.add_htlc(
+        let (incoming_htlc, next_scid) = {
+            let channel = node_lock
+                .get_mut(&scid)
+                .ok_or(CriticalError::ChannelNotFound(scid))?;
+
+            let htlc_index = match channel.add_htlc(
                 &outgoing_node,
                 payment_hash,
                 Htlc {
@@ -949,10 +1069,11 @@ async fn add_htlcs(
                     cltv_expiry: outgoing_cltv,
                 },
             )? {
+                Ok(idx) => idx,
                 // If we couldn't add to this HTLC, we only need to fail back from the preceding hop, so we don't
                 // have to progress our fail_idx.
-                return Ok(Err((fail_idx, e)));
-            }
+                Err(e) => return Ok(Err((fail_idx, e))),
+            };
 
             // If the HTLC was successfully added, then we'll need to remove the HTLC from this channel if we fail,
             // so we progress our failure index to include this node.
@@ -964,10 +1085,11 @@ async fn add_htlcs(
             // represents the fee in that direction.
             //
             // TODO: add invoice-related checks (including final CTLV) if we support non-keysend payments.
-            if i != route.hops.len() - 1 {
-                if let Some(channel) =
-                    node_lock.get(&ShortChannelID::from(route.hops[i + 1].short_channel_id))
-                {
+            let mut next_scid = None;
+            if i != last_hop {
+                next_scid = Some(ShortChannelID::from(route.hops[i + 1].short_channel_id));
+
+                if let Some(channel) = node_lock.get(&next_scid.unwrap()) {
                     if let Err(e) = channel.check_htlc_forward(
                         &hop.pubkey,
                         hop.cltv_expiry_delta,
@@ -980,15 +1102,104 @@ async fn add_htlcs(
                     }
                 }
             }
-        } else {
-            return Err(CriticalError::ChannelNotFound(scid));
+            let incoming_htlc = HtlcRef {
+                channel_id: scid,
+                index: htlc_index,
+            };
+            (incoming_htlc, next_scid)
+        };
+
+        // Before we continue on to the next hop, we'll call any interceptors registered to get external input on the
+        // forwarding decision for this HTLC.
+        //
+        // We drop our node lock so that we can await our interceptors (which may choose to hold the HTLC for a long
+        // time) without holding our entire graph hostage.
+        drop(node_lock);
+
+        // Collect any custom records set by the interceptor for the outgoing link.
+        let mut outgoing_custom_records: HashMap<u64, Vec<u8>> = HashMap::new();
+
+        let (interceptor_trigger, interceptor_listener) = triggered::trigger();
+
+        if !interceptors.is_empty() {
+            let mut intercepts: JoinSet<
+                Result<Result<CustomRecords, ForwardingError>, CriticalError>,
+            > = JoinSet::new();
+
+            for interceptor in interceptors.iter() {
+                let request = InterceptRequest {
+                    forwarding_node: hop.pubkey,
+                    payment_hash,
+                    incoming_htlc: incoming_htlc.clone(),
+                    incoming_custom_records: incoming_custom_records.clone(),
+                    outgoing_channel_id: next_scid,
+                    incoming_amount_msat: outgoing_amount,
+                    outgoing_amount_msat: outgoing_amount - hop.fee_msat,
+                    incoming_expiry_height: outgoing_cltv,
+                    outgoing_expiry_height: outgoing_cltv - hop.cltv_expiry_delta,
+                    shutdown_listener: interceptor_listener.clone(),
+                };
+
+                log::trace!(
+                    "Sending HTLC to intercepor: {} {request}",
+                    interceptor.name()
+                );
+
+                let interceptor_clone = Arc::clone(interceptor);
+                intercepts.spawn(async move { interceptor_clone.intercept_htlc(request).await });
+            }
+
+            // Read results from the interceptors and check whether any of them returned an instruction to fail
+            // the HTLC. If any of the interceptors did return an error, we send a shutdown signal
+            // to the other interceptors that may have not returned yet.
+            let mut interceptor_failure = None;
+            while let Some(res) = intercepts.join_next().await {
+                let res =
+                    res.map_err(|join_err| CriticalError::InterceptorError(join_err.to_string()))?;
+
+                match res {
+                    Ok(Ok(records)) => {
+                        // Interceptor call succeeded and indicated that we should proceed with the forward. Merge
+                        // any custom records provided, failing if interceptors provide duplicate values for the
+                        // same key.
+                        for (k, v) in records {
+                            match outgoing_custom_records.entry(k) {
+                                Entry::Occupied(e) => {
+                                    let existing_value = e.get();
+                                    if *existing_value == v {
+                                        return Err(CriticalError::DuplicateCustomRecord(k));
+                                    }
+                                },
+                                Entry::Vacant(e) => {
+                                    e.insert(v);
+                                },
+                            };
+                        }
+                    },
+                    // Interceptor call succeeded but returned a ForwardingError. If this happens,
+                    // we should send a trigger to other interceptors to let them know they should
+                    // shutdown.
+                    Ok(Err(fwd_error)) => {
+                        interceptor_failure = Some(fwd_error);
+                        interceptor_trigger.trigger();
+                    },
+                    Err(e) => {
+                        return Err(e);
+                    },
+                }
+            }
+
+            if let Some(e) = interceptor_failure {
+                return Ok(Err((fail_idx, e)));
+            }
         }
 
-        // Once we've taken the "hop" to the destination pubkey, it becomes the source of the next outgoing htlc.
+        // Once we've taken the "hop" to the destination pubkey, it becomes the source of the next outgoing htlc and
+        // any outgoing custom records set by the interceptor become the incoming custom records for the next hop.
         outgoing_node = hop.pubkey;
         outgoing_amount -= hop.fee_msat;
         outgoing_cltv -= hop.cltv_expiry_delta;
-
+        incoming_custom_records = outgoing_custom_records;
         // TODO: introduce artificial latency between hops?
     }
 
@@ -1011,7 +1222,9 @@ async fn remove_htlcs(
     route: Path,
     payment_hash: PaymentHash,
     success: bool,
+    interceptors: Vec<Arc<dyn Interceptor>>,
 ) -> Result<(), CriticalError> {
+    let mut outgoing_channel_id = None;
     for (i, hop) in route.hops[0..=resolution_idx].iter().enumerate().rev() {
         // When we add HTLCs, we do so on the state of the node that sent the htlc along the channel so we need to
         // look up our incoming node so that we can remove it when we go backwards. For the first htlc, this is just
@@ -1024,20 +1237,37 @@ async fn remove_htlcs(
 
         // As with when we add HTLCs, we remove them one hop at a time (rather than locking for the whole route) to
         // mimic the behavior of payments in a real network.
-        match nodes
-            .lock()
-            .await
-            .get_mut(&ShortChannelID::from(hop.short_channel_id))
-        {
-            Some(channel) => {
-                channel.remove_htlc(&incoming_node, &payment_hash, success)?;
-            },
+        let mut node_lock = nodes.lock().await;
+        let incoming_scid = ShortChannelID::from(hop.short_channel_id);
+        let (_removed_htlc, index) = match node_lock.get_mut(&incoming_scid) {
+            Some(channel) => channel.remove_htlc(&incoming_node, &payment_hash, success)?,
             None => {
                 return Err(CriticalError::ChannelNotFound(ShortChannelID::from(
                     hop.short_channel_id,
                 )))
             },
+        };
+
+        // We drop our node lock so that we can notify interceptors without blocking other payments processing.
+        drop(node_lock);
+
+        for interceptor in interceptors.iter() {
+            log::trace!("Sending resolution to interceptor: {}", interceptor.name());
+
+            interceptor
+                .notify_resolution(InterceptResolution {
+                    forwarding_node: hop.pubkey,
+                    incoming_htlc: HtlcRef {
+                        channel_id: incoming_scid,
+                        index,
+                    },
+                    outgoing_channel_id,
+                    success,
+                })
+                .await?;
         }
+
+        outgoing_channel_id = Some(incoming_scid);
     }
 
     Ok(())
@@ -1053,9 +1283,18 @@ async fn propagate_payment(
     route: Path,
     payment_hash: PaymentHash,
     sender: Sender<Result<PaymentResult, LightningError>>,
+    interceptors: Vec<Arc<dyn Interceptor>>,
     shutdown: Trigger,
 ) {
-    let notify_result = match add_htlcs(nodes.clone(), source, route.clone(), payment_hash).await {
+    let notify_result = match add_htlcs(
+        nodes.clone(),
+        source,
+        route.clone(),
+        payment_hash,
+        interceptors.clone(),
+    )
+    .await
+    {
         Ok(Ok(_)) => {
             // If we successfully added the htlc, go ahead and remove all the htlcs in the route with successful resolution.
             if let Err(e) = remove_htlcs(
@@ -1065,6 +1304,7 @@ async fn propagate_payment(
                 route,
                 payment_hash,
                 true,
+                interceptors,
             )
             .await
             {
@@ -1080,9 +1320,17 @@ async fn propagate_payment(
             // If we partially added HTLCs along the route, we need to fail them back to the source to clean up our partial
             // state. It's possible that we failed with the very first add, and then we don't need to clean anything up.
             if let Some(resolution_idx) = fail_idx {
-                if remove_htlcs(nodes, resolution_idx, source, route, payment_hash, false)
-                    .await
-                    .is_err()
+                if remove_htlcs(
+                    nodes,
+                    resolution_idx,
+                    source,
+                    route,
+                    payment_hash,
+                    false,
+                    interceptors,
+                )
+                .await
+                .is_err()
                 {
                     shutdown.trigger();
                 }
@@ -1617,6 +1865,21 @@ mod tests {
         ));
     }
 
+    mock! {
+        #[derive(Debug)]
+        TestInterceptor{}
+
+        #[async_trait]
+        impl Interceptor for TestInterceptor {
+            async fn intercept_htlc(&self, req: InterceptRequest) -> Result<Result<CustomRecords, ForwardingError>, CriticalError>;
+            async fn notify_resolution(
+                &self,
+                res: InterceptResolution,
+            ) -> Result<(), CriticalError>;
+            fn name(&self) -> String;
+        }
+    }
+
     /// Contains elements required to test dispatch_payment functionality.
     struct DispatchPaymentTestKit<'a> {
         graph: SimGraph,
@@ -1633,7 +1896,7 @@ mod tests {
         /// Alice (100) --- (0) Bob (100) --- (0) Carol (100) --- (0) Dave
         ///
         /// The nodes pubkeys in this chain of channels are provided in-order for easy access.
-        async fn new(capacity: u64) -> Self {
+        async fn new(capacity: u64, interceptors: Vec<Arc<dyn Interceptor>>) -> Self {
             let (shutdown, _listener) = triggered::trigger();
             let channels = create_simulated_channels(3, capacity);
             let routing_graph = Arc::new(
@@ -1655,8 +1918,13 @@ mod tests {
             nodes.push(channels.last().unwrap().node_2.policy.pubkey);
 
             let kit = DispatchPaymentTestKit {
-                graph: SimGraph::new(channels.clone(), TaskTracker::new(), shutdown.clone())
-                    .expect("could not create test graph"),
+                graph: SimGraph::new(
+                    channels.clone(),
+                    TaskTracker::new(),
+                    interceptors,
+                    shutdown.clone(),
+                )
+                .expect("could not create test graph"),
                 nodes,
                 routing_graph,
                 scorer,
@@ -1696,13 +1964,13 @@ mod tests {
         }
 
         // Sends a test payment from source to destination and waits for the payment to complete, returning the route
-        // used.
-        async fn send_test_payemnt(
+        // used and the payment result.
+        async fn send_test_payment(
             &mut self,
             source: PublicKey,
             dest: PublicKey,
             amt: u64,
-        ) -> Route {
+        ) -> (Route, Result<PaymentResult, LightningError>) {
             let route =
                 find_payment_route(&source, dest, amt, &self.routing_graph, &self.scorer).unwrap();
 
@@ -1710,10 +1978,11 @@ mod tests {
             self.graph
                 .dispatch_payment(source, route.clone(), PaymentHash([1; 32]), sender);
 
+            let payment_result = timeout(Duration::from_millis(10), receiver).await;
             // Assert that we receive from the channel or fail.
-            assert!(timeout(Duration::from_millis(10), receiver).await.is_ok());
+            assert!(payment_result.is_ok());
 
-            route
+            (route, payment_result.unwrap().unwrap())
         }
 
         // Sets the balance on the channel to the tuple provided, used to arrange liquidity for testing.
@@ -1733,12 +2002,12 @@ mod tests {
     #[tokio::test]
     async fn test_successful_dispatch() {
         let chan_capacity = 500_000_000;
-        let mut test_kit = DispatchPaymentTestKit::new(chan_capacity).await;
+        let mut test_kit = DispatchPaymentTestKit::new(chan_capacity, vec![]).await;
 
         // Send a payment that should succeed from Alice -> Dave.
         let mut amt = 20_000;
-        let route = test_kit
-            .send_test_payemnt(test_kit.nodes[0], test_kit.nodes[3], amt)
+        let (route, _) = test_kit
+            .send_test_payment(test_kit.nodes[0], test_kit.nodes[3], amt)
             .await;
 
         let route_total = amt + route.get_total_fees();
@@ -1758,7 +2027,7 @@ mod tests {
         // machine, so we want to specifically hit it. To do this, we'll try to send double the amount that we just
         // pushed to Dave back to Bob, expecting a failure on Dave's outgoing link due to insufficient liquidity.
         let _ = test_kit
-            .send_test_payemnt(test_kit.nodes[3], test_kit.nodes[1], amt * 2)
+            .send_test_payment(test_kit.nodes[3], test_kit.nodes[1], amt * 2)
             .await;
         assert_eq!(test_kit.channel_balances().await, expected_balances);
 
@@ -1767,7 +2036,7 @@ mod tests {
         // use 50% of the channel's capacity, so we need to do two payments.
         amt = bob_to_carol.0 / 2;
         let _ = test_kit
-            .send_test_payemnt(test_kit.nodes[1], test_kit.nodes[2], amt)
+            .send_test_payment(test_kit.nodes[1], test_kit.nodes[2], amt)
             .await;
 
         bob_to_carol = (bob_to_carol.0 / 2, bob_to_carol.1 + amt);
@@ -1776,7 +2045,7 @@ mod tests {
 
         // When we push this amount a second time, all the liquidity should be moved to Carol's end.
         let _ = test_kit
-            .send_test_payemnt(test_kit.nodes[1], test_kit.nodes[2], amt)
+            .send_test_payment(test_kit.nodes[1], test_kit.nodes[2], amt)
             .await;
         bob_to_carol = (0, chan_capacity);
         expected_balances = vec![alice_to_bob, bob_to_carol, carol_to_dave];
@@ -1785,7 +2054,7 @@ mod tests {
         // Finally, we'll test a multi-hop failure by trying to send from Alice -> Dave. Since Bob's liquidity is
         // drained, we expect a failure and unchanged balances along the route.
         let _ = test_kit
-            .send_test_payemnt(test_kit.nodes[0], test_kit.nodes[3], 20_000)
+            .send_test_payment(test_kit.nodes[0], test_kit.nodes[3], 20_000)
             .await;
         assert_eq!(test_kit.channel_balances().await, expected_balances);
 
@@ -1798,12 +2067,12 @@ mod tests {
     #[tokio::test]
     async fn test_successful_multi_hop() {
         let chan_capacity = 500_000_000;
-        let mut test_kit = DispatchPaymentTestKit::new(chan_capacity).await;
+        let mut test_kit = DispatchPaymentTestKit::new(chan_capacity, vec![]).await;
 
         // Send a payment that should succeed from Alice -> Dave.
         let amt = 20_000;
-        let route = test_kit
-            .send_test_payemnt(test_kit.nodes[0], test_kit.nodes[3], amt)
+        let (route, _) = test_kit
+            .send_test_payment(test_kit.nodes[0], test_kit.nodes[3], amt)
             .await;
 
         let route_total = amt + route.get_total_fees();
@@ -1828,12 +2097,12 @@ mod tests {
     #[tokio::test]
     async fn test_single_hop_payments() {
         let chan_capacity = 500_000_000;
-        let mut test_kit = DispatchPaymentTestKit::new(chan_capacity).await;
+        let mut test_kit = DispatchPaymentTestKit::new(chan_capacity, vec![]).await;
 
         // Send a single hop payment from Alice -> Bob, it will succeed because Alice has all the liquidity.
         let amt = 150_000;
         let _ = test_kit
-            .send_test_payemnt(test_kit.nodes[0], test_kit.nodes[1], amt)
+            .send_test_payment(test_kit.nodes[0], test_kit.nodes[1], amt)
             .await;
 
         let expected_balances = vec![
@@ -1846,7 +2115,7 @@ mod tests {
         // Send a single hop payment from Dave -> Carol that will fail due to lack of liquidity, balances should be
         // unchanged.
         let _ = test_kit
-            .send_test_payemnt(test_kit.nodes[3], test_kit.nodes[2], amt)
+            .send_test_payment(test_kit.nodes[3], test_kit.nodes[2], amt)
             .await;
 
         assert_eq!(test_kit.channel_balances().await, expected_balances);
@@ -1860,7 +2129,7 @@ mod tests {
     #[tokio::test]
     async fn test_multi_hop_faiulre() {
         let chan_capacity = 500_000_000;
-        let mut test_kit = DispatchPaymentTestKit::new(chan_capacity).await;
+        let mut test_kit = DispatchPaymentTestKit::new(chan_capacity, vec![]).await;
 
         // Drain liquidity between Bob and Carol to force failures on Bob's outgoing linke.
         test_kit
@@ -1874,7 +2143,7 @@ mod tests {
         // Send a payment from Alice -> Dave which we expect to fail leaving balances unaffected.
         let amt = 150_000;
         let _ = test_kit
-            .send_test_payemnt(test_kit.nodes[0], test_kit.nodes[3], amt)
+            .send_test_payment(test_kit.nodes[0], test_kit.nodes[3], amt)
             .await;
 
         assert_eq!(test_kit.channel_balances().await, expected_balances);
@@ -1887,10 +2156,126 @@ mod tests {
             .await;
 
         let _ = test_kit
-            .send_test_payemnt(test_kit.nodes[3], test_kit.nodes[0], amt)
+            .send_test_payment(test_kit.nodes[3], test_kit.nodes[0], amt)
             .await;
 
         assert_eq!(test_kit.channel_balances().await, expected_balances);
+
+        test_kit.shutdown.trigger();
+        test_kit.graph.tasks.close();
+        test_kit.graph.tasks.wait().await;
+    }
+
+    /// Tests intercepted htlc failures.
+    #[tokio::test]
+    async fn test_intercepted_htlc_failure() {
+        // Test with 2 interceptors where one of them returns a signal to fail the htlc.
+        let mut mock_interceptor_1 = MockTestInterceptor::new();
+        mock_interceptor_1
+            .expect_intercept_htlc()
+            .returning(|_| Ok(Ok(CustomRecords::default())));
+        mock_interceptor_1
+            .expect_notify_resolution()
+            .returning(|_| Ok(()));
+
+        let mut mock_interceptor_2 = MockTestInterceptor::new();
+        mock_interceptor_2.expect_intercept_htlc().returning(|_| {
+            Ok(Err(ForwardingError::InterceptorError(
+                "failing from mock interceptor".into(),
+            )))
+        });
+        mock_interceptor_2
+            .expect_notify_resolution()
+            .returning(|_| Ok(()));
+
+        let chan_capacity = 500_000_000;
+        let mock_1 = Arc::new(mock_interceptor_1);
+        let mock_2 = Arc::new(mock_interceptor_2);
+        let mut test_kit = DispatchPaymentTestKit::new(chan_capacity, vec![mock_1, mock_2]).await;
+        let expected_balances = vec![(chan_capacity, 0), (chan_capacity, 0), (chan_capacity, 0)];
+
+        // Send payment where there is enough liquidity but one of the interceptors fails the htlc.
+        let amt = 150_000;
+        let (_, result) = test_kit
+            .send_test_payment(test_kit.nodes[0], test_kit.nodes[3], amt)
+            .await;
+
+        assert_eq!(test_kit.channel_balances().await, expected_balances);
+        assert!(matches!(
+            result.unwrap().payment_outcome,
+            PaymentOutcome::Unknown
+        ));
+
+        let mut mock_interceptor_1 = MockTestInterceptor::new();
+        mock_interceptor_1
+            .expect_intercept_htlc()
+            .returning(|_| Ok(Ok(CustomRecords::from([(1000, vec![1])]))));
+        mock_interceptor_1
+            .expect_notify_resolution()
+            .returning(|_| Ok(()));
+
+        let mut mock_interceptor_2 = MockTestInterceptor::new();
+        mock_interceptor_2
+            .expect_intercept_htlc()
+            .returning(|_| Ok(Ok(CustomRecords::from([(1000, vec![1])]))));
+        mock_interceptor_2
+            .expect_notify_resolution()
+            .returning(|_| Ok(()));
+
+        let mock_1 = Arc::new(mock_interceptor_1);
+        let mock_2 = Arc::new(mock_interceptor_2);
+        let mut test_kit = DispatchPaymentTestKit::new(chan_capacity, vec![mock_1, mock_2]).await;
+
+        // Test intercepted htlc with conflicting records. Conflicting records should fail the
+        // htlc.
+        let (_, result) = test_kit
+            .send_test_payment(test_kit.nodes[0], test_kit.nodes[3], amt)
+            .await;
+
+        assert!(matches!(
+            result.unwrap().payment_outcome,
+            PaymentOutcome::Unknown
+        ));
+
+        test_kit.shutdown.trigger();
+        test_kit.graph.tasks.close();
+        test_kit.graph.tasks.wait().await;
+    }
+
+    /// Tests intercepted htlc success.
+    #[tokio::test]
+    async fn test_intercepted_htlc_success() {
+        let mut mock_interceptor_1 = MockTestInterceptor::new();
+        mock_interceptor_1
+            .expect_intercept_htlc()
+            .returning(|_| Ok(Ok(CustomRecords::default())));
+        mock_interceptor_1
+            .expect_notify_resolution()
+            .returning(|_| Ok(()));
+
+        let chan_capacity = 500_000_000;
+        let mock_1 = Arc::new(mock_interceptor_1);
+        let mut test_kit = DispatchPaymentTestKit::new(chan_capacity, vec![mock_1]).await;
+
+        // Test payment with enough liquidity and interceptor succeeds.
+        let amt = 150_000;
+        let (route, result) = test_kit
+            .send_test_payment(test_kit.nodes[0], test_kit.nodes[3], amt)
+            .await;
+
+        let route_total = amt + route.get_total_fees();
+        let hop_1_amt = amt + route.paths[0].hops[1].fee_msat;
+        let expected_balances = vec![
+            (chan_capacity - route_total, route_total),
+            (chan_capacity - hop_1_amt, hop_1_amt),
+            (chan_capacity - amt, amt),
+        ];
+
+        assert_eq!(test_kit.channel_balances().await, expected_balances);
+        assert!(matches!(
+            result.unwrap().payment_outcome,
+            PaymentOutcome::Success
+        ));
 
         test_kit.shutdown.trigger();
         test_kit.graph.tasks.close();
