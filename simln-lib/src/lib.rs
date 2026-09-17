@@ -1016,17 +1016,19 @@ impl<C: Clock + 'static> Simulation<C> {
         for (pk, node) in self.nodes.iter() {
             let chan_capacity = node.channel_capacities().await?;
 
-            if let Err(e) = RandomPaymentActivity::validate_capacity(
-                chan_capacity,
-                self.cfg.expected_payment_msat,
-            ) {
+            // Don't double count channel capacity because each channel reports the total balance between counter
+            // parities. Track capacity separately to be used for our network generator.
+            let capacity = chan_capacity / 2;
+
+            // Validate against the same capacity that the activity generator is created with below, otherwise nodes
+            // that fail validation there will error out the whole simulation instead of being skipped here.
+            if let Err(e) =
+                RandomPaymentActivity::validate_capacity(capacity, self.cfg.expected_payment_msat)
+            {
                 log::warn!("Node: {} not eligible for activity generation: {e}.", *pk);
                 continue;
             }
 
-            // Don't double count channel capacity because each channel reports the total balance between counter
-            // parities. Track capacity separately to be used for our network generator.
-            let capacity = chan_capacity / 2;
             let node_info = node.get_node_info(pk).await?;
             active_nodes.insert(node_info.pubkey, (node_info, capacity));
         }

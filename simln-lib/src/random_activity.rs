@@ -14,6 +14,11 @@ use crate::{
 const HOURS_PER_MONTH: u64 = 30 * 24;
 const SECONDS_PER_MONTH: u64 = HOURS_PER_MONTH * 60 * 60;
 
+/// The maximum standard deviation of the log normal distribution used to pick payment amounts. Sigma derived from
+/// node capacity alone reaches ~4.5 on mainnet sized graphs, which places the bulk of the distribution far below the
+/// expected payment amount.
+const MAX_PAYMENT_SIGMA: f64 = 2.0;
+
 #[derive(Debug, Error)]
 pub enum RandomActivityError {
     #[error("Value error: {0}")]
@@ -247,11 +252,11 @@ impl PaymentGenerator for RandomPaymentActivity {
 
     /// Returns the payment amount for a payment to a node with the destination capacity provided. The expected value
     /// for the payment is the simulation expected payment amount, and the variance is determined by the channel
-    /// capacity of the source and destination node. Variance is calculated such that 95% of payment amounts generated
-    /// will fall between the expected payment amount and 50% of the capacity of the node with the least channel
-    /// capacity. While the expected value of payments remains the same, scaling variance by node capacity means that
-    /// nodes with more deployed capital will see a larger range of payment values than those with smaller total
-    /// channel capacity.
+    /// capacity of the source and destination node, up to [`MAX_PAYMENT_SIGMA`]. Variance is calculated such that 95%
+    /// of payment amounts generated will fall between the expected payment amount and 50% of the capacity of the node
+    /// with the least channel capacity, until that capacity is large enough for the cap to take over. While the
+    /// expected value of payments remains the same, scaling variance by node capacity means that nodes with more
+    /// deployed capital will see a larger range of payment values than those with smaller total channel capacity.
     fn payment_amount(
         &self,
         destination_capacity: Option<u64>,
@@ -265,7 +270,6 @@ impl PaymentGenerator for RandomPaymentActivity {
         let ln_pmt_amt = (self.expected_payment_amt as f64).ln();
         let ln_limit = (payment_limit as f64).ln();
 
-        let mu = 2.0 * ln_pmt_amt - ln_limit;
         let sigma_square = 2.0 * (ln_limit - ln_pmt_amt);
 
         if sigma_square < 0.0 {
@@ -274,15 +278,21 @@ impl PaymentGenerator for RandomPaymentActivity {
             )));
         }
 
-        let log_normal = LogNormal::new(mu, sigma_square.sqrt())
-            .map_err(|e| PaymentGenerationError(e.to_string()))?;
+        // Cap sigma so that the distribution does not spread out indefinitely as the capacity of the nodes grows.
+        // Mu is then set from sigma so that the mean of the distribution remains the expected payment amount. When
+        // sigma is below the cap this is equivalent to mu = 2ln(expected_payment_amt) - ln(payment_limit).
+        let sigma = sigma_square.sqrt().min(MAX_PAYMENT_SIGMA);
+        let mu = ln_pmt_amt - sigma.powi(2) / 2.0;
+
+        let log_normal =
+            LogNormal::new(mu, sigma).map_err(|e| PaymentGenerationError(e.to_string()))?;
 
         let mut rng = self
             .rng
             .0
             .lock()
             .map_err(|e| PaymentGenerationError(e.to_string()))?;
-        let payment_amount = log_normal.sample(&mut *rng) as u64;
+        let payment_amount = std::cmp::min(log_normal.sample(&mut *rng) as u64, payment_limit);
 
         Ok(payment_amount)
     }
